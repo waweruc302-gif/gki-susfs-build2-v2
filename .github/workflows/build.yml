@@ -6,12 +6,14 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+
       - name: Free disk and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo fallocate -l 8G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
           df -h / /mnt; free -h
+
       - name: Install tools
         run: |
           sudo apt-get update
@@ -62,22 +64,65 @@ jobs:
           cp "$GITHUB_WORKSPACE/scmversion.txt" ~/gki/common/.scmversion
           cat ~/gki/common/.scmversion; echo
 
+      - name: Hook KernelSU-Next and SUSFS into the tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ~/gki/common
+
+          # SUSFS source files, only if the patch did not already create them
+          if [ -d ~/susfs4ksu/kernel_patches/fs ]; then
+            cp -rnv ~/susfs4ksu/kernel_patches/fs/* fs/ || true
+          fi
+          if [ -d ~/susfs4ksu/kernel_patches/include/linux ]; then
+            cp -rnv ~/susfs4ksu/kernel_patches/include/linux/* include/linux/ || true
+          fi
+          ls -l fs/susfs.c include/linux/susfs*.h
+
+          # Link the KernelSU driver into drivers/
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q 'CONFIG_KSU' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          tail -3 drivers/Makefile
+          tail -3 drivers/Kconfig
+          ls -l drivers/kernelsu/Kconfig drivers/kernelsu/Makefile
+
+          # Enable in defconfig
+          cat >> arch/arm64/configs/gki_defconfig <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          EOF
+          tail -8 arch/arm64/configs/gki_defconfig
+
+          # Custom build config: same as stock GKI, but skip check_defconfig
+          cat > build.config.ksu <<'EOF'
+          . ${ROOT_DIR}/common/build.config.gki.aarch64
+          POST_DEFCONFIG_CMDS=""
+          EOF
+          cat build.config.ksu
+
       - name: Build
         shell: bash
         run: |
           set -euo pipefail
           cd ~/gki
-          SKIP_MRPROPER=1 BUILD_CONFIG=common/build.config.gki.aarch64 ./build/build.sh 2>&1 | tee ~/build.log
+          SKIP_MRPROPER=1 BUILD_CONFIG=common/build.config.ksu ./build/build.sh 2>&1 | tee ~/build.log
           test -f out/android12-5.4/dist/Image
 
-      - name: Check version string
+      - name: Check version string and KernelSU
         shell: bash
         run: |
           set -euo pipefail
           test -f ~/gki/out/android12-5.4/dist/Image
+          grep -E "CONFIG_KSU|CONFIG_KPROBES=|CONFIG_KSU_SUSFS" ~/gki/out/android12-5.4/common/.config || true
           strings ~/gki/out/android12-5.4/dist/Image > /tmp/s.txt
           grep -m1 "^Linux version 5" /tmp/s.txt
           grep -m1 "^Linux version 5" /tmp/s.txt | grep -q -- '-ab603 ('
+          grep -qi "kernelsu" /tmp/s.txt
+          grep -qi "susfs" /tmp/s.txt
 
       - name: List undefined symbols
         if: failure()
