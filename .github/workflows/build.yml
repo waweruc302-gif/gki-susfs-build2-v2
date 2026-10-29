@@ -76,6 +76,55 @@ jobs:
         run: |
           set -euo pipefail
           cd ~/gki/common
+          cp -rnv ~/susfs4ksu/kernel_patches/fs/. fs/ || true
+          cp -rnv ~/susfs4ksu/kernel_patches/include/linux/. include/linux/ || true
+          ls -l fs/susfs.c include/linux/susfs.h
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q 'CONFIG_KSU' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          tail -3 drivers/Makefile
+          tail -3 drivers/Kconfig
+          ls -l drivers/kernelsu/Kconfig drivers/kernelsu/Makefile
+          grep -n "SUSFS" drivers/kernelsu/Kconfig || echo "WARNING: no SUSFS option in KernelSU Kconfig"
+          printf '%s\n' 'CONFIG_KSU=y' 'CONFIG_KSU_SUSFS=y' 'CONFIG_KPROBES=y' 'CONFIG_HAVE_KPROBES=y' 'CONFIG_KPROBE_EVENTS=y' >> arch/arm64/configs/gki_defconfig
+          tail -8 arch/arm64/configs/gki_defconfig
+          printf '%s\n' '. ${ROOT_DIR}/common/build.config.gki.aarch64' 'POST_DEFCONFIG_CMDS=""' > build.config.ksu
+          cat build.config.ksu
 
-          if [ -d ~/susfs4ksu/kernel_patches/fs ]; then
-            cp
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ~/gki
+          SKIP_MRPROPER=1 BUILD_CONFIG=common/build.config.ksu ./build/build.sh 2>&1 | tee ~/build.log
+          test -f out/android12-5.4/dist/Image
+
+      - name: Check version string and KernelSU
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f ~/gki/out/android12-5.4/dist/Image
+          grep -E "CONFIG_KSU|CONFIG_KPROBES=" ~/gki/out/android12-5.4/common/.config || true
+          strings ~/gki/out/android12-5.4/dist/Image > /tmp/s.txt
+          grep -m1 "^Linux version 5" /tmp/s.txt
+          grep -m1 "^Linux version 5" /tmp/s.txt | grep -q -- '-ab603 ('
+          grep -q "^CONFIG_KSU=y" ~/gki/out/android12-5.4/common/.config
+          grep -q "^CONFIG_KSU_SUSFS=y" ~/gki/out/android12-5.4/common/.config
+          grep -q "ksud" /tmp/s.txt
+
+      - name: List undefined symbols
+        if: failure()
+        shell: bash
+        run: |
+          grep -E "undefined (reference|symbol)" ~/build.log | sort -u || true
+          echo "--- first error lines ---"
+          grep -m5 "error:" ~/build.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-dist
+          path: |
+            /home/runner/gki/out/android12-5.4/dist
+            /home/runner/build.log
+            /home/runner/gki/ksu_commit.txt
