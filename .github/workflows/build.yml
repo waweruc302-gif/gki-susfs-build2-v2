@@ -48,21 +48,29 @@ jobs:
 
           git clone --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
           ls ~/susfs4ksu/kernel_patches/
+          ls ~/susfs4ksu/kernel_patches/KernelSU/ || true
+
+          APPLY_FAIL=0
 
           cd KernelSU
           cp ~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch .
-          git apply --reject --whitespace=fix 10_enable_susfs_for_ksu.patch || true
-          echo "--- .rej files (unapplied hunks), if any ---"
+          git apply --reject --whitespace=fix 10_enable_susfs_for_ksu.patch || APPLY_FAIL=1
+          echo "--- KernelSU .rej files, if any ---"
           find . -name "*.rej" -exec echo {} \; -exec cat {} \;
           cd ..
 
           cp ~/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
-          git apply --reject --whitespace=fix 50_add_susfs_in_kernel-5.4.patch || true
-          echo "--- .rej files (unapplied hunks), if any ---"
-          find . -name "*.rej" -exec echo {} \; -exec cat {} \;
+          git apply --reject --whitespace=fix 50_add_susfs_in_kernel-5.4.patch || APPLY_FAIL=1
+          echo "--- kernel .rej files, if any ---"
+          find . -name "*.rej" -not -path "./KernelSU/*" -exec echo {} \; -exec cat {} \;
 
           cp "$GITHUB_WORKSPACE/scmversion.txt" ~/gki/common/.scmversion
           cat ~/gki/common/.scmversion; echo
+
+          if [ "$APPLY_FAIL" = "1" ]; then
+            echo "PATCH FAILED: see .rej output above"
+            exit 1
+          fi
 
       - name: Hook KernelSU-Next and SUSFS into the tree
         shell: bash
@@ -70,7 +78,6 @@ jobs:
           set -euo pipefail
           cd ~/gki/common
 
-          # SUSFS source files, only if the patch did not already create them
           if [ -d ~/susfs4ksu/kernel_patches/fs ]; then
             cp -rnv ~/susfs4ksu/kernel_patches/fs/* fs/ || true
           fi
@@ -79,15 +86,14 @@ jobs:
           fi
           ls -l fs/susfs.c include/linux/susfs*.h
 
-          # Link the KernelSU driver into drivers/
           ln -sfn ../KernelSU/kernel drivers/kernelsu
           grep -q 'CONFIG_KSU' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           tail -3 drivers/Makefile
           tail -3 drivers/Kconfig
           ls -l drivers/kernelsu/Kconfig drivers/kernelsu/Makefile
+          grep -n "SUSFS" drivers/kernelsu/Kconfig || echo "WARNING: no SUSFS option in KernelSU Kconfig"
 
-          # Enable in defconfig
           cat >> arch/arm64/configs/gki_defconfig <<'EOF'
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
@@ -97,7 +103,6 @@ jobs:
           EOF
           tail -8 arch/arm64/configs/gki_defconfig
 
-          # Custom build config: same as stock GKI, but skip check_defconfig
           cat > build.config.ksu <<'EOF'
           . ${ROOT_DIR}/common/build.config.gki.aarch64
           POST_DEFCONFIG_CMDS=""
@@ -117,12 +122,13 @@ jobs:
         run: |
           set -euo pipefail
           test -f ~/gki/out/android12-5.4/dist/Image
-          grep -E "CONFIG_KSU|CONFIG_KPROBES=|CONFIG_KSU_SUSFS" ~/gki/out/android12-5.4/common/.config || true
+          grep -E "CONFIG_KSU|CONFIG_KPROBES=" ~/gki/out/android12-5.4/common/.config || true
           strings ~/gki/out/android12-5.4/dist/Image > /tmp/s.txt
           grep -m1 "^Linux version 5" /tmp/s.txt
           grep -m1 "^Linux version 5" /tmp/s.txt | grep -q -- '-ab603 ('
-          grep -qi "kernelsu" /tmp/s.txt
-          grep -qi "susfs" /tmp/s.txt
+          grep -q "^CONFIG_KSU=y" ~/gki/out/android12-5.4/common/.config
+          grep -q "^CONFIG_KSU_SUSFS=y" ~/gki/out/android12-5.4/common/.config
+          grep -q "ksud" /tmp/s.txt
 
       - name: List undefined symbols
         if: failure()
