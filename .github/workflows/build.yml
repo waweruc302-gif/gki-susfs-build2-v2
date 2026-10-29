@@ -80,6 +80,13 @@ jobs:
           cp -rnv ~/susfs4ksu/kernel_patches/include/linux/. include/linux/ || true
           ls -l fs/susfs.c include/linux/susfs.h
           ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -rl "linux/pgtable.h" KernelSU/kernel | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|g'
+          echo "--- pgtable includes now ---"
+          grep -rn "pgtable.h" KernelSU/kernel || true
+          echo "--- headers KernelSU wants that this tree may lack (info only) ---"
+          for h in $(grep -rhoE '#include <(linux|asm)/[^>]+>' KernelSU/kernel | sed -E 's/#include <(.*)>/\1/' | sort -u); do
+            if [ ! -e "include/$h" ] && [ ! -e "arch/arm64/include/$h" ] && [ ! -e "include/uapi/$h" ] && [ ! -e "arch/arm64/include/uapi/$h" ]; then echo "MISSING HEADER: $h"; fi
+          done || true
           grep -q 'CONFIG_KSU' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           tail -3 drivers/Makefile
@@ -117,8 +124,8 @@ jobs:
         shell: bash
         run: |
           grep -E "undefined (reference|symbol)" ~/build.log | sort -u || true
-          echo "--- first error lines ---"
-          grep -m5 "error:" ~/build.log || true
+          echo "--- compiler errors ---"
+          grep -E "error:|fatal error" ~/build.log | head -20 || true
 
       - uses: actions/upload-artifact@v4
         if: always()
