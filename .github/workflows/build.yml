@@ -111,17 +111,19 @@ jobs:
         shell: bash
         run: |
           cd ~/gki/common
-          echo "--- what the driver calls ---"
-          grep -rhoE 'susfs_[a-z_]+' KernelSU/kernel | sort -u
-          echo "--- what the kernel header declares ---"
-          grep -hoE 'susfs_[a-z_]+' include/linux/susfs.h | sort -u
-          echo "--- no_su / umounted in header ---"
-          grep -n "no_su\|umounted" include/linux/susfs.h
-          echo "--- sucompat includes ---"
-          grep -n "include\|SUSFS" KernelSU/kernel/feature/sucompat.c | head -30
-          echo "--- susfs4ksu branches ---"
-          git -C ~/susfs4ksu branch -a
-          git -C ~/susfs4ksu log --oneline -3
+          grep -rhoE 'susfs_[a-z_0-9]+' KernelSU/kernel | sort -u > /tmp/drv.txt || true
+          grep -hoE 'susfs_[a-z_0-9]+' include/linux/susfs.h | sort -u > /tmp/hdr.txt || true
+          echo "--- driver calls, NOT declared in kernel header ---"
+          comm -23 /tmp/drv.txt /tmp/hdr.txt || true
+          echo "--- susfs calls in sucompat.c ---"
+          grep -n "susfs_" KernelSU/kernel/feature/sucompat.c | head -30 || true
+          echo "--- no_su anywhere in susfs4ksu ---"
+          grep -rn "no_su" ~/susfs4ksu --include=*.patch --include=*.h --include=*.c | head -20 || true
+          echo "--- susfs versions ---"
+          grep -rn "SUSFS_VERSION" KernelSU/kernel/Makefile include/linux/susfs.h | head || true
+          echo "--- susfs4ksu remote branches ---"
+          git -C ~/susfs4ksu ls-remote --heads origin || true
+          exit 0
 
       - name: Build
         shell: bash
@@ -148,9 +150,13 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          grep -E "undefined (reference|symbol)" ~/build.log | sort -u || true
-          echo "--- compiler errors ---"
-          grep -E "error:|fatal error" ~/build.log | head -20 || true
+          if [ -f ~/build.log ]; then
+            grep -E "undefined (reference|symbol)" ~/build.log | sort -u || true
+            echo "--- compiler errors ---"
+            grep -E "error:|fatal error" ~/build.log | head -20 || true
+          else
+            echo "no build.log (Build step did not run)"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
