@@ -3,19 +3,59 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan = find which KernelSU tag accepts the SUSFS patch; build = full kernel build"
+        description: "inspect = show the failing hunks of the SUSFS patch; scan = rank all tags; build = full kernel build"
         type: choice
-        default: scan
+        default: inspect
         options:
+          - inspect
           - scan
           - build
       ksu_repo:
-        description: "build mode: KernelSU repo URL"
-        default: "https://github.com/pershoot/KernelSU-Next"
+        description: "KernelSU repo URL"
+        default: "https://github.com/KernelSU-Next/KernelSU-Next"
       ksu_branch:
-        description: "build mode: branch/tag/commit"
-        default: "dev-susfs"
+        description: "Branch/tag/commit"
+        default: "v0.9.5"
 jobs:
+  inspect:
+    if: inputs.mode == 'inspect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Show failing hunks of the SUSFS patch
+        shell: bash
+        env:
+          IN_REPO: ${{ inputs.ksu_repo }}
+          IN_BRANCH: ${{ inputs.ksu_branch }}
+        run: |
+          set +e +o pipefail
+          git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
+          git clone --quiet "$IN_REPO" ~/ksu
+          cd ~/ksu
+          git checkout -q "$IN_BRANCH"
+          P=~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          {
+            echo "## Source"
+            echo '```'; git log -1 --oneline; echo '```'
+            echo "## git apply --reject result"
+            echo '```'
+            git apply --reject --whitespace=fix "$P" 2>&1 | head -40
+            echo '```'
+            echo "## Failed hunks (.rej files)"
+            for f in $(find . -name '*.rej'); do
+              echo "### $f"
+              echo '```diff'
+              head -80 "$f"
+              echo '```'
+              src="${f%.rej}"
+              echo "Current code in $src (first 140 lines of each hunk area):"
+              echo '```'
+              grep -n "" "$src" | head -140
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY" | head -150
+
   scan:
     if: inputs.mode == 'scan'
     runs-on: ubuntu-latest
@@ -27,7 +67,6 @@ jobs:
           set +e +o pipefail
           git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
           P=~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-          ls -l "$P"
           for repo in KernelSU-Next/KernelSU-Next tiann/KernelSU; do
             rm -rf ~/ksu
             git clone --quiet "https://github.com/$repo" ~/ksu || continue
@@ -48,7 +87,6 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             cd ~
           done
-          cat "$GITHUB_STEP_SUMMARY"
 
   build:
     if: inputs.mode == 'build'
