@@ -12,13 +12,6 @@ jobs:
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu
           git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/s
           cd ~/s
-          {
-            echo "## Source layout"
-            echo '```'
-            ls ksu_susfs ksu_susfs/jni 2>&1
-            grep -rn "SUSFS_VERSION" kernel_patches/include/linux/susfs.h
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
           D=$(dirname "$(find ksu_susfs -name main.c | head -1)")
           mkdir -p ~/stub/android
           cat > ~/stub/android/log.h << 'EOF'
@@ -28,11 +21,14 @@ jobs:
           #define __android_log_print(p, t, ...) fprintf(stderr, __VA_ARGS__)
           EOF
           cd "$D"
-          aarch64-linux-gnu-gcc -static -O2 -I ~/stub -I . -o ~/ksu_susfs_arm64 main.c > ~/cc.log 2>&1
+          aarch64-linux-gnu-gcc -static -O2 -include limits.h -I ~/stub -I . \
+            -Dst_atime_nsec=st_atim.tv_nsec -Dst_mtime_nsec=st_mtim.tv_nsec -Dst_ctime_nsec=st_ctim.tv_nsec \
+            -Dst_atimensec=st_atim.tv_nsec -Dst_mtimensec=st_mtim.tv_nsec -Dst_ctimensec=st_ctim.tv_nsec \
+            -o ~/ksu_susfs_arm64 main.c > ~/cc.log 2>&1
           {
             echo "## Compile result"
             echo '```'
-            tail -40 ~/cc.log
+            grep -E "error|undefined" ~/cc.log | head -30
             ls -l ~/ksu_susfs_arm64 2>&1
             file ~/ksu_susfs_arm64 2>&1
             echo '```'
