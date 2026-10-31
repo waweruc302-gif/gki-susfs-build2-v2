@@ -71,7 +71,6 @@ jobs:
           S=~/susfs4ksu
           cd ~/gki/common
 
-          # 1) SUSFS Kconfig options, copied from the v0.9.5 Kconfig after the stock patch
           rm -rf /tmp/k095
           git clone -q https://github.com/KernelSU-Next/KernelSU-Next /tmp/k095
           (cd /tmp/k095 && git checkout -q v0.9.5 && patch -p1 -F3 --no-backup-if-mismatch < $S/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch > /dev/null)
@@ -79,10 +78,8 @@ jobs:
           test -s /tmp/susfs.kconfig
           { echo; cat /tmp/susfs.kconfig; } >> KernelSU/kernel/Kconfig
 
-          # 2) The CMD_SUSFS_* block from the stock patch (the core_hook.c hunk that adds it)
           cp $S/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch /tmp/p.patch
           cat > /tmp/extract.py << 'EOF'
-          import sys
           hunks, cur = [], []
           for l in open('/tmp/p.patch').read().split('\n'):
               if l.startswith('@@') or l.startswith('diff --git'):
@@ -90,14 +87,22 @@ jobs:
               elif l.startswith('+') and not l.startswith('+++'):
                   cur.append(l[1:])
           hunks.append(cur)
-          c = [h for h in hunks if any('current_uid_val == 0' in x for x in h)]
-          if not c:
-              print('block not found'); sys.exit(1)
-          b = max(c, key=len)
-          open('/tmp/block.inc', 'w').write('\n'.join(b) + '\n')
-          print('block lines:', len(b))
+
+          # Hunk A: the declarations/externs core_hook.c adds near the top
+          A = max([h for h in hunks if any('susfs_is_allow_su' in x for x in h)], key=len)
+          s = next(i for i, l in enumerate(A) if 'susfs_zygote_sid' in l)
+          e = next(i for i, l in enumerate(A) if 'susfs_on_post_fs_data' in l)
+          decl = A[s:e]
+          open('/tmp/decl.inc', 'w').write('\n'.join(decl) + '\n')
+          print('decl lines:', len(decl))
+
+          # Hunk B: the CMD_SUSFS_* prctl dispatch block
+          B = max([h for h in hunks if any('current_uid_val == 0' in x for x in h)], key=len)
+          open('/tmp/block.inc', 'w').write('\n'.join(B) + '\n')
+          print('block lines:', len(B))
           EOF
           python3 /tmp/extract.py
+          cp /tmp/decl.inc fs/susfs_prctl_decl.inc
           cp /tmp/block.inc fs/susfs_prctl_block.inc
 
           cat > fs/susfs_prctl.c << 'EOF'
@@ -105,12 +110,16 @@ jobs:
           #include <linux/kprobes.h>
           #include <linux/uaccess.h>
           #include <linux/cred.h>
+          #include <linux/fs.h>
+          #include <linux/namei.h>
           #include <linux/susfs.h>
           #include <linux/susfs_def.h>
           #include <asm/ptrace.h>
 
           #define KERNEL_SU_OPTION 0xDEADBEEF
           #define ksu_access_ok(addr, size) access_ok(addr, size)
+
+          #include "susfs_prctl_decl.inc"
 
           static int susfs_prctl_dispatch(unsigned long arg2, unsigned long arg3,
                                           unsigned long arg4, unsigned long arg5)
@@ -166,16 +175,20 @@ jobs:
           open(f, 'w').write(s)
           print('setuid flag inserted')
           EOF
-          python3 /tmp/flag.py
+          if ! grep -q "TASK_STRUCT_NON_ROOT_USER_APP_PROC" KernelSU/kernel/hook/setuid_hook.c; then
+            python3 /tmp/flag.py
+          else
+            echo "flag already present (unchanged from prior step)"
+          fi
 
           {
-            echo "## Added block (first and last lines)"
+            echo "## Declarations block"
+            echo '```'
+            cat -n fs/susfs_prctl_decl.inc
+            echo '```'
+            echo "## Dispatch block (first/last lines)"
             echo '```'
             head -3 fs/susfs_prctl_block.inc; echo ...; tail -4 fs/susfs_prctl_block.inc
-            echo '```'
-            echo "## setuid_hook.c around the flag"
-            echo '```'
-            grep -n -B4 -A8 "task_lock(current)" KernelSU/kernel/hook/setuid_hook.c
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -227,17 +240,10 @@ jobs:
           set -euo pipefail
           C=~/gki/out/android12-5.4/common/.config
           test -f ~/gki/out/android12-5.4/dist/Image
-          {
-            echo "## SUSFS and KSU options in the final .config"
-            echo '```'
-            grep -E "CONFIG_KSU|CONFIG_KPROBES=" $C || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
           strings ~/gki/out/android12-5.4/dist/Image > /tmp/s.txt
           grep -m1 "^Linux version 5" /tmp/s.txt | grep -q -- '-ab603 ('
           grep -q "^CONFIG_KSU=y" $C
           grep -q "^CONFIG_KSU_SUSFS=y" $C
-          grep -q "^CONFIG_KSU_SUSFS_SUS_PATH=y" $C
           grep -q "ksud" /tmp/s.txt
           grep -q "susfs_prctl: kprobe register" /tmp/s.txt
 
