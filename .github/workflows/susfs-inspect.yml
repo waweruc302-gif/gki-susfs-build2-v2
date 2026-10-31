@@ -4,7 +4,7 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Check core_hook.c piece in isolation
+      - name: Full dump - everything needed in one shot
         shell: bash
         run: |
           set +e +o pipefail
@@ -12,17 +12,48 @@ jobs:
           cd ~/k && git checkout -q v3.4.0-legacy
           git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/s
           P=~/s/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-          # Extract just the core_hook.c hunk into its own patch file
-          awk '/^diff --git a\/kernel\/core_hook.c/{p=1} /^diff --git/ && !/core_hook.c/{p=0} p' "$P" > /tmp/core.patch
-          wc -l /tmp/core.patch
-          patch -p1 -F3 --no-backup-if-mismatch --dry-run < /tmp/core.patch > ~/out.log 2>&1
+
           {
-            echo "## core_hook.c patch, dry run"
+            echo "## 1. Full kernel/ file tree"
             echo '```'
-            cat ~/out.log | head -60
+            find kernel -name '*.c' -o -name '*.h' | sort
             echo '```'
-            echo "## Current ksu_try_umount / zygote / ksu_domain presence in core_hook.c"
+
+            echo "## 2. Functions the 4 missing symbols need, searched everywhere"
             echo '```'
-            grep -n "ksu_try_umount\|is_zygote\|is_ksu_domain\|_domain(" kernel/core_hook.c | head -30
+            grep -rln "ksu_try_umount\|try_umount\|is_zygote\|is_ksu_domain\|is_manager\|susfs_is_current" kernel
+            echo '```'
+
+            echo "## 3. sys_reboot/supercall entry point (known working hook)"
+            echo '```'
+            cat kernel/supercall/supercall.c 2>/dev/null | head -100
+            echo '```'
+
+            echo "## 4. Every file the patch touches, and whether it exists here"
+            echo '```'
+            for f in $(grep '^diff --git a/' "$P" | sed 's|diff --git a/||; s| b/.*||'); do
+              if [ -f "$f" ]; then echo "EXISTS: $f"; else echo "MISSING: $f"; fi
+            done
+            echo '```'
+
+            echo "## 5. Dry-run patch per existing file only"
+            echo '```'
+            for f in $(grep '^diff --git a/' "$P" | sed 's|diff --git a/||; s| b/.*||'); do
+              if [ -f "$f" ]; then
+                echo "--- $f ---"
+                awk -v file="$f" '
+                  $0 ~ "^diff --git a/" file" " {p=1; print; next}
+                  /^diff --git/ {p=0}
+                  p' "$P" > /tmp/one.patch
+                patch -p1 -F3 --dry-run --no-backup-if-mismatch < /tmp/one.patch 2>&1 | grep -E "Hunk|FAILED|succeeded|out of"
+              fi
+            done
+            echo '```'
+
+            echo "## 6. setuid_hook.c and lsm_hooks.c full content (small files, likely relevant)"
+            echo '```c'
+            cat kernel/hook/setuid_hook.c 2>/dev/null
+            echo '--- lsm_hooks.c ---'
+            cat kernel/hook/lsm_hooks.c 2>/dev/null
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
