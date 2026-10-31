@@ -2,14 +2,56 @@ name: build-kernel
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "scan = find which KernelSU tag accepts the SUSFS patch; build = full kernel build"
+        type: choice
+        default: scan
+        options:
+          - scan
+          - build
       ksu_repo:
-        description: "KernelSU-Next repo URL"
-        default: "https://github.com/KernelSU-Next/KernelSU-Next"
+        description: "build mode: KernelSU repo URL"
+        default: "https://github.com/pershoot/KernelSU-Next"
       ksu_branch:
-        description: "Branch/tag/commit"
-        default: "v3.0.1-legacy"
+        description: "build mode: branch/tag/commit"
+        default: "dev-susfs"
 jobs:
+  scan:
+    if: inputs.mode == 'scan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Scan KernelSU repos for the SUSFS patch
+        shell: bash
+        run: |
+          set +e +o pipefail
+          git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
+          P=~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          ls -l "$P"
+          for repo in KernelSU-Next/KernelSU-Next tiann/KernelSU; do
+            rm -rf ~/ksu
+            git clone --quiet "https://github.com/$repo" ~/ksu || continue
+            cd ~/ksu
+            : > ~/res.txt
+            for ref in $(git tag) $(git branch -r | grep -v HEAD | sed 's|origin/||'); do
+              git checkout -q -f "$ref" 2>/dev/null || continue
+              out=$(git apply --check "$P" 2>&1)
+              fails=$(echo "$out" | grep -c "patch failed\|No such file")
+              core=no; [ -f kernel/core_hook.c ] && core=yes
+              echo "$fails  $ref  core_hook.c=$core" >> ~/res.txt
+            done
+            {
+              echo "## $repo (failed files, lower is better, 0 = patch applies)"
+              echo '```'
+              sort -n ~/res.txt | head -25
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            cd ~
+          done
+          cat "$GITHUB_STEP_SUMMARY"
+
   build:
+    if: inputs.mode == 'build'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -38,7 +80,7 @@ jobs:
           ~/repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.4 --depth=1
           ~/repo sync -c --no-tags --no-clone-bundle -j4
 
-      - name: Pin kernel tag, get KernelSU-Next, apply SUSFS patches
+      - name: Pin kernel tag, get KernelSU, apply SUSFS patches
         shell: bash
         env:
           IN_REPO: ${{ inputs.ksu_repo }}
@@ -63,8 +105,7 @@ jobs:
               (cd KernelSU && git apply --whitespace=fix 10_enable_susfs_for_ksu.patch)
               echo ">>> $IN_REPO $IN_BRANCH accepted the SUSFS patch"
             else
-              echo "FAILED: SUSFS patch does not apply to $IN_REPO $IN_BRANCH"
-              echo "FAILED: SUSFS patch does not apply to $IN_REPO $IN_BRANCH" >> "$GITHUB_STEP_SUMMARY"
+              echo "FAILED: SUSFS patch does not apply to $IN_REPO $IN_BRANCH" | tee -a "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
           fi
@@ -79,7 +120,7 @@ jobs:
           cp "$GITHUB_WORKSPACE/scmversion.txt" ~/gki/common/.scmversion
           cat ~/gki/common/.scmversion; echo
 
-      - name: Hook KernelSU-Next and SUSFS into the tree
+      - name: Hook KernelSU and SUSFS into the tree
         shell: bash
         run: |
           set -euo pipefail
@@ -89,7 +130,6 @@ jobs:
           ls -l fs/susfs.c include/linux/susfs.h
           ln -sfn ../KernelSU/kernel drivers/kernelsu
 
-          # --- 5.4 compatibility swaps ---
           grep -rl "linux/pgtable.h" KernelSU/kernel | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|g'
           grep -rl "linux/minmax.h" KernelSU/kernel | xargs -r sed -i 's|<linux/minmax.h>|<linux/kernel.h>|g'
           if ! grep -rq "strncpy_from_user_nofault" include/linux/; then
@@ -141,7 +181,7 @@ jobs:
           set +e +o pipefail
           {
             echo "## KernelSU source"
-            echo '```'; cat ~/gki/ksu_commit.txt; echo '```'
+            echo '```'; cat ~/gki/ksu_commit.txt 2>/dev/null || echo "not reached"; echo '```'
             echo "## Compiler errors (unique)"
             echo '```'
             if [ -f ~/build.log ]; then
