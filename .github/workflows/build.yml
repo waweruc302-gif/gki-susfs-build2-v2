@@ -76,18 +76,6 @@ jobs:
               exit 1
             fi
             find . -name '*.orig' -delete
-            {
-              echo "## Check: renamed functions (definitions and callers must agree)"
-              echo '```'
-              grep -rn "escape_to_root\|setup_selinux(" kernel | head -30
-              echo '```'
-              echo "## Check: where the SUSFS helpers landed in selinux.c (must sit between functions)"
-              echo '```'
-              grep -n "ifdef CONFIG_KSU_SUSFS\|susfs_set_sid\|define DEVPTS_DOMAIN\|^bool is_zygote\|^u32 ksu_get_devpts_sid" kernel/selinux/selinux.c | head -30
-              n=$(grep -n "static inline void susfs_set_sid" kernel/selinux/selinux.c | head -1 | cut -d: -f1)
-              [ -n "$n" ] && sed -n "$((n-12)),$((n+3))p" kernel/selinux/selinux.c
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
             cd ..
           fi
 
@@ -104,17 +92,17 @@ jobs:
       - name: Hook KernelSU and SUSFS into the tree
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
           cd ~/gki/common
           cp -rnv ~/susfs4ksu/kernel_patches/fs/. fs/ || true
           cp -rnv ~/susfs4ksu/kernel_patches/include/linux/. include/linux/ || true
           ls -l fs/susfs.c include/linux/susfs.h
           ln -sfn ../KernelSU/kernel drivers/kernelsu
 
-          grep -rl "linux/pgtable.h" KernelSU/kernel | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|g'
-          grep -rl "linux/minmax.h" KernelSU/kernel | xargs -r sed -i 's|<linux/minmax.h>|<linux/kernel.h>|g'
+          grep -rl "linux/pgtable.h" KernelSU/kernel | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|g' || true
+          grep -rl "linux/minmax.h" KernelSU/kernel | xargs -r sed -i 's|<linux/minmax.h>|<linux/kernel.h>|g' || true
           if ! grep -rq "strncpy_from_user_nofault" include/linux/; then
-            grep -rl "strncpy_from_user_nofault" KernelSU/kernel | xargs -r sed -i 's/strncpy_from_user_nofault/strncpy_from_unsafe_user/g'
+            grep -rl "strncpy_from_user_nofault" KernelSU/kernel | xargs -r sed -i 's/strncpy_from_user_nofault/strncpy_from_unsafe_user/g' || true
           fi
 
           echo "--- headers KernelSU wants that this tree may lack ---"
