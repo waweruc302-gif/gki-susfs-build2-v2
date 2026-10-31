@@ -1,0 +1,45 @@
+name: susfs-tool
+on: workflow_dispatch
+jobs:
+  tool:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build ksu_susfs v1.5.5 userspace tool
+        shell: bash
+        run: |
+          set +e +o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/s
+          cd ~/s
+          {
+            echo "## Source layout"
+            echo '```'
+            ls ksu_susfs ksu_susfs/jni 2>&1
+            grep -rn "SUSFS_VERSION" kernel_patches/include/linux/susfs.h
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          D=$(dirname "$(find ksu_susfs -name main.c | head -1)")
+          mkdir -p ~/stub/android
+          cat > ~/stub/android/log.h << 'EOF'
+          #include <stdio.h>
+          #define ANDROID_LOG_INFO 4
+          #define ANDROID_LOG_ERROR 6
+          #define __android_log_print(p, t, ...) fprintf(stderr, __VA_ARGS__)
+          EOF
+          cd "$D"
+          aarch64-linux-gnu-gcc -static -O2 -I ~/stub -I . -o ~/ksu_susfs_arm64 main.c > ~/cc.log 2>&1
+          {
+            echo "## Compile result"
+            echo '```'
+            tail -40 ~/cc.log
+            ls -l ~/ksu_susfs_arm64 2>&1
+            file ~/ksu_susfs_arm64 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -f ~/ksu_susfs_arm64 ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ksu_susfs_arm64
+          path: /home/runner/ksu_susfs_arm64
