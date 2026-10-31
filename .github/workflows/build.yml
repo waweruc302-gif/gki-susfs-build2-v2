@@ -32,29 +32,51 @@ jobs:
           git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
           git clone --quiet "$IN_REPO" ~/ksu
           cd ~/ksu
-          git checkout -q "$IN_BRANCH"
+          git checkout -q "$IN_BRANCH" || echo "CHECKOUT FAILED for $IN_BRANCH" >> "$GITHUB_STEP_SUMMARY"
           P=~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+
           {
             echo "## Source"
-            echo '```'; git log -1 --oneline; echo '```'
-            echo "## git apply --reject result"
+            echo '```'; git describe --tags --always; git log -1 --oneline; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 1) strict apply with reject files (no pipe, so it is not killed)
+          git apply --reject --whitespace=fix "$P" > ~/apply.txt 2>&1
+          {
+            echo "## git apply --reject (filtered)"
             echo '```'
-            git apply --reject --whitespace=fix "$P" 2>&1 | head -40
+            grep -E '^(Checking|Applied|Applying|Hunk|Rejected|error: patch failed|error: .*(does not apply|No such file))' ~/apply.txt | head -60
             echo '```'
             echo "## Failed hunks (.rej files)"
             for f in $(find . -name '*.rej'); do
               echo "### $f"
               echo '```diff'
-              head -80 "$f"
-              echo '```'
-              src="${f%.rej}"
-              echo "Current code in $src (first 140 lines of each hunk area):"
-              echo '```'
-              grep -n "" "$src" | head -140
+              head -120 "$f"
               echo '```'
             done
+            echo "## Where the failing code lives in core_hook.c"
+            echo '```'
+            grep -n "escape_to_root\|disable_seccomp\|setup_selinux\|ksu_handle_rename\|ksu_handle_setuid\|#endif" kernel/core_hook.c | head -60
+            echo '```'
+            echo "## core_hook.c lines 90-290"
+            echo '```'
+            sed -n '90,290p' kernel/core_hook.c | cat -n | sed 's/^ *\([0-9]*\)/\1+89/'
+            echo '```'
+            echo "## The patch's own core_hook.c section"
+            echo '```diff'
+            awk '/^diff --git a\/kernel\/core_hook.c/{p=1;print;next} /^diff --git/{p=0} p' "$P" | head -220
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          cat "$GITHUB_STEP_SUMMARY" | head -150
+
+          # 2) fuzzy apply test on a clean tree
+          git checkout -q -f . ; git clean -fdq
+          patch -p1 -F3 --no-backup-if-mismatch < "$P" > ~/fuzz.txt 2>&1
+          {
+            echo "## Fuzzy apply test (patch -F3)"
+            echo '```'
+            grep -E "^(patching file|Hunk|[0-9]+ out of)|FAILED|fuzz|offset" ~/fuzz.txt | head -60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   scan:
     if: inputs.mode == 'scan'
@@ -80,7 +102,7 @@ jobs:
               echo "$fails  $ref  core_hook.c=$core" >> ~/res.txt
             done
             {
-              echo "## $repo (failed files, lower is better, 0 = patch applies)"
+              echo "## $repo (failed hunks, lower is better, 0 = patch applies)"
               echo '```'
               sort -n ~/res.txt | head -25
               echo '```'
