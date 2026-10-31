@@ -125,6 +125,7 @@ jobs:
       - name: Check SUSFS API match (gate before build)
         shell: bash
         run: |
+          set +e +o pipefail
           cd ~/gki/common
           D=~/diag.txt
           {
@@ -164,6 +165,7 @@ jobs:
             echo "STOP: driver calls SUSFS functions the kernel header does not declare (see Summary)."
             exit 1
           fi
+          exit 0
 
       - name: Build
         shell: bash
