@@ -2,6 +2,13 @@ name: build-kernel
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "quick = compile driver only and list errors; full = build Image"
+        type: choice
+        default: quick
+        options:
+          - quick
+          - full
       ksu_repo:
         description: "Optional KernelSU-Next repo URL (blank = default chain)"
         default: ""
@@ -121,53 +128,55 @@ jobs:
           tail -8 arch/arm64/configs/gki_defconfig
           printf '%s\n' '. ${ROOT_DIR}/common/build.config.gki.aarch64' 'POST_DEFCONFIG_CMDS=""' > build.config.ksu
           cat build.config.ksu
+          # quick config: same as above but only compile the driver and susfs
+          printf '%s\n' '. ${ROOT_DIR}/common/build.config.ksu' 'MAKE_GOALS="prepare drivers/kernelsu/ fs/susfs.o"' > build.config.ksu.quick
 
-      - name: Check SUSFS API match (gate before build)
+      - name: Diagnostics (informational, never stops the run)
         shell: bash
         run: |
           set +e +o pipefail
           cd ~/gki/common
           D=~/diag.txt
           {
-            echo "=== susfs4ksu commit ==="
+            echo "=== susfs4ksu ==="
             git -C ~/susfs4ksu log -1 --oneline
-            git -C ~/susfs4ksu ls-remote --heads origin
-            echo
             echo "=== KernelSU source ==="
             cat ~/gki/ksu_commit.txt
-            echo
             echo "=== files present ==="
             ls -l include/linux/susfs*.h fs/susfs.c 2>&1
-            echo
-            echo "=== .rej / .orig in kernel tree ==="
+            echo "=== .rej / .orig ==="
             find . \( -name '*.rej' -o -name '*.orig' \) -not -path './KernelSU/*' | head
-            echo
-            echo "=== susfs_ calls in driver NOT declared in include/linux/susfs.h ==="
-            grep -rhoE 'susfs_[a-z_0-9]+' KernelSU/kernel --include=*.c --include=*.h | sort -u > /tmp/drv.txt
-            grep -hoE 'susfs_[a-z_0-9]+' include/linux/susfs.h | sort -u > /tmp/hdr.txt
-            comm -23 /tmp/drv.txt /tmp/hdr.txt | tee /tmp/undecl.txt
-            echo
-            echo "=== sucompat.c susfs lines ==="
-            grep -n "susfs\|SUSFS" KernelSU/kernel/feature/sucompat.c | head -30
-            echo
-            echo "=== 'no_su' in susfs4ksu ==="
-            grep -rn "no_su" ~/susfs4ksu --include=*.patch --include=*.h --include=*.c | head -20
-            echo
             echo "=== SUSFS_VERSION ==="
             grep -rn "SUSFS_VERSION" KernelSU/kernel/Makefile include/linux/susfs.h | head
-            echo
-            echo "=== all functions declared in susfs.h ==="
-            cat /tmp/hdr.txt
+            echo "=== sucompat.c susfs lines ==="
+            grep -n "susfs\|SUSFS" KernelSU/kernel/feature/sucompat.c | head -30
           } > "$D" 2>&1
           { echo '```'; cat "$D"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           cat "$D"
-          if [ -s /tmp/undecl.txt ]; then
-            echo "STOP: driver calls SUSFS functions the kernel header does not declare (see Summary)."
-            exit 1
-          fi
+          exit 0
+
+      - name: Quick compile (driver + susfs only)
+        if: inputs.mode != 'full'
+        shell: bash
+        run: |
+          set +e +o pipefail
+          cd ~/gki
+          SKIP_MRPROPER=1 BUILD_CONFIG=common/build.config.ksu.quick ./build/build.sh -k 2>&1 | tee ~/build.log
+          {
+            echo "## Compiler errors (unique)"
+            echo '```'
+            grep -E "error:|fatal error|undefined (reference|symbol)" ~/build.log | sed 's|/home/runner/gki/common/||' | sort -u | head -80
+            echo '```'
+            echo "## Files that failed"
+            echo '```'
+            grep -E "\*\*\* \[.*\] Error" ~/build.log | sort -u | head -30
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E "error:|fatal error" ~/build.log | sort -u | head -80
           exit 0
 
       - name: Build
+        if: inputs.mode == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -176,6 +185,7 @@ jobs:
           test -f out/android12-5.4/dist/Image
 
       - name: Check version string and KernelSU
+        if: inputs.mode == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -188,16 +198,16 @@ jobs:
           grep -q "^CONFIG_KSU_SUSFS=y" ~/gki/out/android12-5.4/common/.config
           grep -q "ksud" /tmp/s.txt
 
-      - name: List undefined symbols
-        if: failure()
+      - name: List compiler errors on failure
+        if: failure() && inputs.mode == 'full'
         shell: bash
         run: |
           if [ -f ~/build.log ]; then
             grep -E "undefined (reference|symbol)" ~/build.log | sort -u || true
             echo "--- compiler errors ---"
-            grep -E "error:|fatal error" ~/build.log | head -20 || true
+            grep -E "error:|fatal error" ~/build.log | sort -u | head -40 || true
           else
-            echo "no build.log (Build step did not run)"
+            echo "no build.log"
           fi
 
       - uses: actions/upload-artifact@v4
