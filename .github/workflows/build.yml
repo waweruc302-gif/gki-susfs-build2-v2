@@ -7,7 +7,7 @@ on:
         default: "https://github.com/KernelSU-Next/KernelSU-Next"
       ksu_branch:
         description: "Branch/tag/commit"
-        default: "v0.9.5"
+        default: "v3.4.0-legacy"
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -38,7 +38,7 @@ jobs:
           ~/repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.4 --depth=1
           ~/repo sync -c --no-tags --no-clone-bundle -j4
 
-      - name: Pin kernel tag, get KernelSU, apply SUSFS patches
+      - name: Pin kernel tag, get KernelSU, apply SUSFS kernel patch
         shell: bash
         env:
           IN_REPO: ${{ inputs.ksu_repo }}
@@ -55,32 +55,7 @@ jobs:
           rm -rf KernelSU
           git clone --quiet "$IN_REPO" KernelSU
           (cd KernelSU && git checkout --quiet "$IN_BRANCH")
-
-          if grep -q "SUSFS" KernelSU/kernel/Kconfig; then
-            echo ">>> $IN_REPO $IN_BRANCH already has SUSFS"
-          else
-            cd KernelSU
-            set +e
-            patch -p1 -F3 --no-backup-if-mismatch < ~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch > ~/ksu_patch.log 2>&1
-            rc=$?
-            set -e
-            {
-              echo "## SUSFS patch on KernelSU (patch -F3)"
-              echo '```'
-              grep -E "^(patching file|Hunk|[0-9]+ out of)|FAILED|fuzz|offset" ~/ksu_patch.log | head -80
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            if [ $rc -ne 0 ] || grep -q "FAILED" ~/ksu_patch.log || [ -n "$(find . -name '*.rej')" ]; then
-              echo "FAILED: SUSFS patch did not fully apply" | tee -a "$GITHUB_STEP_SUMMARY"
-              cat ~/ksu_patch.log
-              exit 1
-            fi
-            find . -name '*.orig' -delete
-            cd ..
-          fi
-
           (cd KernelSU && git rev-parse HEAD && git remote get-url origin && git describe --tags --always) | tee ~/gki/ksu_commit.txt
-          grep -n "SUSFS" KernelSU/kernel/Kconfig | head -20
 
           cp ~/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
           git apply --reject --whitespace=fix 50_add_susfs_in_kernel-5.4.patch
@@ -89,14 +64,129 @@ jobs:
           cp "$GITHUB_WORKSPACE/scmversion.txt" ~/gki/common/.scmversion
           cat ~/gki/common/.scmversion; echo
 
+      - name: Add prctl dispatch, hide flag and SUSFS Kconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          S=~/susfs4ksu
+          cd ~/gki/common
+
+          # 1) SUSFS Kconfig options, copied from the v0.9.5 Kconfig after the stock patch
+          rm -rf /tmp/k095
+          git clone -q https://github.com/KernelSU-Next/KernelSU-Next /tmp/k095
+          (cd /tmp/k095 && git checkout -q v0.9.5 && patch -p1 -F3 --no-backup-if-mismatch < $S/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch > /dev/null)
+          awk '/^config KSU_SUSFS$/{p=1} p' /tmp/k095/kernel/Kconfig | grep -v '^endmenu' > /tmp/susfs.kconfig
+          test -s /tmp/susfs.kconfig
+          { echo; cat /tmp/susfs.kconfig; } >> KernelSU/kernel/Kconfig
+
+          # 2) The CMD_SUSFS_* block from the stock patch (the core_hook.c hunk that adds it)
+          cp $S/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch /tmp/p.patch
+          cat > /tmp/extract.py << 'EOF'
+          import sys
+          hunks, cur = [], []
+          for l in open('/tmp/p.patch').read().split('\n'):
+              if l.startswith('@@') or l.startswith('diff --git'):
+                  hunks.append(cur); cur = []
+              elif l.startswith('+') and not l.startswith('+++'):
+                  cur.append(l[1:])
+          hunks.append(cur)
+          c = [h for h in hunks if any('current_uid_val == 0' in x for x in h)]
+          if not c:
+              print('block not found'); sys.exit(1)
+          b = max(c, key=len)
+          open('/tmp/block.inc', 'w').write('\n'.join(b) + '\n')
+          print('block lines:', len(b))
+          EOF
+          python3 /tmp/extract.py
+          cp /tmp/block.inc fs/susfs_prctl_block.inc
+
+          cat > fs/susfs_prctl.c << 'EOF'
+          #include <linux/kernel.h>
+          #include <linux/kprobes.h>
+          #include <linux/uaccess.h>
+          #include <linux/cred.h>
+          #include <linux/susfs.h>
+          #include <linux/susfs_def.h>
+          #include <asm/ptrace.h>
+
+          #define KERNEL_SU_OPTION 0xDEADBEEF
+          #define ksu_access_ok(addr, size) access_ok(addr, size)
+
+          static int susfs_prctl_dispatch(unsigned long arg2, unsigned long arg3,
+                                          unsigned long arg4, unsigned long arg5)
+          {
+                  uid_t current_uid_val = current_uid().val;
+          #include "susfs_prctl_block.inc"
+                  return 1;
+          }
+
+          static int susfs_prctl_pre(struct kprobe *p, struct pt_regs *regs)
+          {
+                  struct pt_regs *r = (struct pt_regs *)regs->regs[0];
+
+                  if (!r || r->regs[0] != KERNEL_SU_OPTION)
+                          return 0;
+                  susfs_prctl_dispatch(r->regs[1], r->regs[2], r->regs[3], r->regs[4]);
+                  return 0;
+          }
+
+          static struct kprobe susfs_prctl_kp = {
+                  .symbol_name = "__arm64_sys_prctl",
+                  .pre_handler = susfs_prctl_pre,
+          };
+
+          static int __init susfs_prctl_init(void)
+          {
+                  int rc = register_kprobe(&susfs_prctl_kp);
+
+                  pr_info("susfs_prctl: kprobe register rc=%d\n", rc);
+                  return 0;
+          }
+          late_initcall(susfs_prctl_init);
+          EOF
+          echo 'obj-$(CONFIG_KSU_SUSFS) += susfs_prctl.o' >> fs/Makefile
+
+          # 3) Hide flag in ksu_handle_setresuid
+          cat > /tmp/flag.py << 'EOF'
+          import re, sys
+          f = 'KernelSU/kernel/hook/setuid_hook.c'
+          s = open(f).read()
+          pat = re.compile(r'(\} else \{\n)(#ifdef KSU_KPROBES_HOOK\n\s*ksu_clear_task_tracepoint_flag_if_needed\(current\);)')
+          add = ('#ifdef CONFIG_KSU_SUSFS\n'
+                 '        if (new_uid % 100000 >= 10000 && new_uid % 100000 <= 19999) {\n'
+                 '            task_lock(current);\n'
+                 '            current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;\n'
+                 '            task_unlock(current);\n'
+                 '        }\n'
+                 '#endif\n')
+          s, n = pat.subn(lambda m: m.group(1) + add + m.group(2), s, count=1)
+          if n != 1:
+              print('setuid anchor not found'); sys.exit(1)
+          s = s.replace('#include <linux/uidgid.h>', '#include <linux/uidgid.h>\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif', 1)
+          open(f, 'w').write(s)
+          print('setuid flag inserted')
+          EOF
+          python3 /tmp/flag.py
+
+          {
+            echo "## Added block (first and last lines)"
+            echo '```'
+            head -3 fs/susfs_prctl_block.inc; echo ...; tail -4 fs/susfs_prctl_block.inc
+            echo '```'
+            echo "## setuid_hook.c around the flag"
+            echo '```'
+            grep -n -B4 -A8 "task_lock(current)" KernelSU/kernel/hook/setuid_hook.c
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Hook KernelSU and SUSFS into the tree
         shell: bash
         run: |
           set -eu
           cd ~/gki/common
-          cp -rnv ~/susfs4ksu/kernel_patches/fs/. fs/ || true
-          cp -rnv ~/susfs4ksu/kernel_patches/include/linux/. include/linux/ || true
-          ls -l fs/susfs.c include/linux/susfs.h
+          cp -rn ~/susfs4ksu/kernel_patches/fs/. fs/ || true
+          cp -rn ~/susfs4ksu/kernel_patches/include/linux/. include/linux/ || true
+          ls -l fs/susfs.c fs/susfs_prctl.c include/linux/susfs.h
           ln -sfn ../KernelSU/kernel drivers/kernelsu
 
           grep -rl "linux/pgtable.h" KernelSU/kernel | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|g' || true
@@ -105,16 +195,17 @@ jobs:
             grep -rl "strncpy_from_user_nofault" KernelSU/kernel | xargs -r sed -i 's/strncpy_from_user_nofault/strncpy_from_unsafe_user/g' || true
           fi
 
-          echo "--- headers KernelSU wants that this tree may lack ---"
-          for h in $(grep -rhoE '#include <(linux|asm)/[^>]+>' KernelSU/kernel | sed -E 's/#include <(.*)>/\1/' | sort -u); do
-            if [ ! -e "include/$h" ] && [ ! -e "arch/arm64/include/$h" ] && [ ! -e "include/uapi/$h" ] && [ ! -e "arch/arm64/include/uapi/$h" ]; then echo "MISSING HEADER: $h"; fi
-          done || true
-
           grep -q 'CONFIG_KSU' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          ls -l drivers/kernelsu/Kconfig drivers/kernelsu/Makefile
-          grep -n "SUSFS" drivers/kernelsu/Kconfig || echo "WARNING: no SUSFS option in KernelSU Kconfig"
-          printf '%s\n' 'CONFIG_KSU=y' 'CONFIG_KSU_SUSFS=y' 'CONFIG_KPROBES=y' 'CONFIG_HAVE_KPROBES=y' 'CONFIG_KPROBE_EVENTS=y' >> arch/arm64/configs/gki_defconfig
+          printf '%s\n' \
+            'CONFIG_KSU=y' 'CONFIG_KPROBES=y' 'CONFIG_HAVE_KPROBES=y' 'CONFIG_KPROBE_EVENTS=y' \
+            'CONFIG_KSU_SUSFS=y' 'CONFIG_KSU_SUSFS_SUS_PATH=y' 'CONFIG_KSU_SUSFS_SUS_MOUNT=y' \
+            'CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y' 'CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y' \
+            'CONFIG_KSU_SUSFS_SUS_KSTAT=y' 'CONFIG_KSU_SUSFS_TRY_UMOUNT=y' \
+            'CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y' 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y' \
+            'CONFIG_KSU_SUSFS_ENABLE_LOG=y' 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' \
+            'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y' 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y' \
+            '# CONFIG_KSU_SUSFS_SUS_SU is not set' >> arch/arm64/configs/gki_defconfig
           printf '%s\n' '. ${ROOT_DIR}/common/build.config.gki.aarch64' 'POST_DEFCONFIG_CMDS=""' > build.config.ksu
 
       - name: Build (keep going to collect every error)
@@ -130,18 +221,25 @@ jobs:
           echo "NO IMAGE PRODUCED"
           exit 1
 
-      - name: Check version string and KernelSU
+      - name: Check version string and features
         shell: bash
         run: |
           set -euo pipefail
+          C=~/gki/out/android12-5.4/common/.config
           test -f ~/gki/out/android12-5.4/dist/Image
-          grep -E "CONFIG_KSU|CONFIG_KPROBES=" ~/gki/out/android12-5.4/common/.config || true
+          {
+            echo "## SUSFS and KSU options in the final .config"
+            echo '```'
+            grep -E "CONFIG_KSU|CONFIG_KPROBES=" $C || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           strings ~/gki/out/android12-5.4/dist/Image > /tmp/s.txt
-          grep -m1 "^Linux version 5" /tmp/s.txt
           grep -m1 "^Linux version 5" /tmp/s.txt | grep -q -- '-ab603 ('
-          grep -q "^CONFIG_KSU=y" ~/gki/out/android12-5.4/common/.config
-          grep -q "^CONFIG_KSU_SUSFS=y" ~/gki/out/android12-5.4/common/.config
+          grep -q "^CONFIG_KSU=y" $C
+          grep -q "^CONFIG_KSU_SUSFS=y" $C
+          grep -q "^CONFIG_KSU_SUSFS_SUS_PATH=y" $C
           grep -q "ksud" /tmp/s.txt
+          grep -q "susfs_prctl: kprobe register" /tmp/s.txt
 
       - name: Summary of errors
         if: always()
