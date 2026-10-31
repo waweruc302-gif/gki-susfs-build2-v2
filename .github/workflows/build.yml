@@ -1,5 +1,13 @@
 name: build-kernel
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_repo:
+        description: "Optional KernelSU-Next repo URL (blank = default chain)"
+        default: ""
+      ksu_branch:
+        description: "Optional branch/tag/commit for that repo"
+        default: ""
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,6 +40,9 @@ jobs:
 
       - name: Pin kernel tag, pick KernelSU-Next with SUSFS, patch kernel
         shell: bash
+        env:
+          IN_REPO: ${{ inputs.ksu_repo }}
+          IN_BRANCH: ${{ inputs.ksu_branch }}
         run: |
           set -euo pipefail
           git clone --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
@@ -57,9 +68,13 @@ jobs:
             echo ">>> $1 $2: no usable SUSFS path"; return 1
           }
 
-          pick_ksu https://github.com/KernelSU-Next/KernelSU-Next legacy \
-            || pick_ksu https://github.com/pershoot/KernelSU-Next dev-susfs \
-            || { echo "NO KERNELSU SOURCE WORKED"; exit 1; }
+          if [ -n "$IN_REPO" ] && [ -n "$IN_BRANCH" ]; then
+            pick_ksu "$IN_REPO" "$IN_BRANCH" || { echo "MANUAL KERNELSU SOURCE FAILED"; exit 1; }
+          else
+            pick_ksu https://github.com/KernelSU-Next/KernelSU-Next legacy \
+              || pick_ksu https://github.com/pershoot/KernelSU-Next dev-susfs \
+              || { echo "NO KERNELSU SOURCE WORKED"; exit 1; }
+          fi
 
           (cd KernelSU && git rev-parse HEAD && git remote get-url origin && git branch --show-current) | tee ~/gki/ksu_commit.txt
           grep -n "SUSFS" KernelSU/kernel/Kconfig | head -20
@@ -107,23 +122,48 @@ jobs:
           printf '%s\n' '. ${ROOT_DIR}/common/build.config.gki.aarch64' 'POST_DEFCONFIG_CMDS=""' > build.config.ksu
           cat build.config.ksu
 
-      - name: Diagnose SUSFS API mismatch
+      - name: Check SUSFS API match (gate before build)
         shell: bash
         run: |
           cd ~/gki/common
-          grep -rhoE 'susfs_[a-z_0-9]+' KernelSU/kernel | sort -u > /tmp/drv.txt || true
-          grep -hoE 'susfs_[a-z_0-9]+' include/linux/susfs.h | sort -u > /tmp/hdr.txt || true
-          echo "--- driver calls, NOT declared in kernel header ---"
-          comm -23 /tmp/drv.txt /tmp/hdr.txt || true
-          echo "--- susfs calls in sucompat.c ---"
-          grep -n "susfs_" KernelSU/kernel/feature/sucompat.c | head -30 || true
-          echo "--- no_su anywhere in susfs4ksu ---"
-          grep -rn "no_su" ~/susfs4ksu --include=*.patch --include=*.h --include=*.c | head -20 || true
-          echo "--- susfs versions ---"
-          grep -rn "SUSFS_VERSION" KernelSU/kernel/Makefile include/linux/susfs.h | head || true
-          echo "--- susfs4ksu remote branches ---"
-          git -C ~/susfs4ksu ls-remote --heads origin || true
-          exit 0
+          D=~/diag.txt
+          {
+            echo "=== susfs4ksu commit ==="
+            git -C ~/susfs4ksu log -1 --oneline
+            git -C ~/susfs4ksu ls-remote --heads origin
+            echo
+            echo "=== KernelSU source ==="
+            cat ~/gki/ksu_commit.txt
+            echo
+            echo "=== files present ==="
+            ls -l include/linux/susfs*.h fs/susfs.c 2>&1
+            echo
+            echo "=== .rej / .orig in kernel tree ==="
+            find . \( -name '*.rej' -o -name '*.orig' \) -not -path './KernelSU/*' | head
+            echo
+            echo "=== susfs_ calls in driver NOT declared in include/linux/susfs.h ==="
+            grep -rhoE 'susfs_[a-z_0-9]+' KernelSU/kernel --include=*.c --include=*.h | sort -u > /tmp/drv.txt
+            grep -hoE 'susfs_[a-z_0-9]+' include/linux/susfs.h | sort -u > /tmp/hdr.txt
+            comm -23 /tmp/drv.txt /tmp/hdr.txt | tee /tmp/undecl.txt
+            echo
+            echo "=== sucompat.c susfs lines ==="
+            grep -n "susfs\|SUSFS" KernelSU/kernel/feature/sucompat.c | head -30
+            echo
+            echo "=== 'no_su' in susfs4ksu ==="
+            grep -rn "no_su" ~/susfs4ksu --include=*.patch --include=*.h --include=*.c | head -20
+            echo
+            echo "=== SUSFS_VERSION ==="
+            grep -rn "SUSFS_VERSION" KernelSU/kernel/Makefile include/linux/susfs.h | head
+            echo
+            echo "=== all functions declared in susfs.h ==="
+            cat /tmp/hdr.txt
+          } > "$D" 2>&1
+          { echo '```'; cat "$D"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat "$D"
+          if [ -s /tmp/undecl.txt ]; then
+            echo "STOP: driver calls SUSFS functions the kernel header does not declare (see Summary)."
+            exit 1
+          fi
 
       - name: Build
         shell: bash
@@ -165,4 +205,5 @@ jobs:
           path: |
             /home/runner/gki/out/android12-5.4/dist
             /home/runner/build.log
+            /home/runner/diag.txt
             /home/runner/gki/ksu_commit.txt
