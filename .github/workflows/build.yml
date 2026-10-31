@@ -2,14 +2,6 @@ name: build-kernel
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "inspect = show the failing hunks of the SUSFS patch; scan = rank all tags; build = full kernel build"
-        type: choice
-        default: inspect
-        options:
-          - inspect
-          - scan
-          - build
       ksu_repo:
         description: "KernelSU repo URL"
         default: "https://github.com/KernelSU-Next/KernelSU-Next"
@@ -17,101 +9,7 @@ on:
         description: "Branch/tag/commit"
         default: "v0.9.5"
 jobs:
-  inspect:
-    if: inputs.mode == 'inspect'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Show failing hunks of the SUSFS patch
-        shell: bash
-        env:
-          IN_REPO: ${{ inputs.ksu_repo }}
-          IN_BRANCH: ${{ inputs.ksu_branch }}
-        run: |
-          set +e +o pipefail
-          git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
-          git clone --quiet "$IN_REPO" ~/ksu
-          cd ~/ksu
-          git checkout -q "$IN_BRANCH" || echo "CHECKOUT FAILED for $IN_BRANCH" >> "$GITHUB_STEP_SUMMARY"
-          P=~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-
-          {
-            echo "## Source"
-            echo '```'; git describe --tags --always; git log -1 --oneline; echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # 1) strict apply with reject files (no pipe, so it is not killed)
-          git apply --reject --whitespace=fix "$P" > ~/apply.txt 2>&1
-          {
-            echo "## git apply --reject (filtered)"
-            echo '```'
-            grep -E '^(Checking|Applied|Applying|Hunk|Rejected|error: patch failed|error: .*(does not apply|No such file))' ~/apply.txt | head -60
-            echo '```'
-            echo "## Failed hunks (.rej files)"
-            for f in $(find . -name '*.rej'); do
-              echo "### $f"
-              echo '```diff'
-              head -120 "$f"
-              echo '```'
-            done
-            echo "## Where the failing code lives in core_hook.c"
-            echo '```'
-            grep -n "escape_to_root\|disable_seccomp\|setup_selinux\|ksu_handle_rename\|ksu_handle_setuid\|#endif" kernel/core_hook.c | head -60
-            echo '```'
-            echo "## core_hook.c lines 90-290"
-            echo '```'
-            sed -n '90,290p' kernel/core_hook.c | cat -n | sed 's/^ *\([0-9]*\)/\1+89/'
-            echo '```'
-            echo "## The patch's own core_hook.c section"
-            echo '```diff'
-            awk '/^diff --git a\/kernel\/core_hook.c/{p=1;print;next} /^diff --git/{p=0} p' "$P" | head -220
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # 2) fuzzy apply test on a clean tree
-          git checkout -q -f . ; git clean -fdq
-          patch -p1 -F3 --no-backup-if-mismatch < "$P" > ~/fuzz.txt 2>&1
-          {
-            echo "## Fuzzy apply test (patch -F3)"
-            echo '```'
-            grep -E "^(patching file|Hunk|[0-9]+ out of)|FAILED|fuzz|offset" ~/fuzz.txt | head -60
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  scan:
-    if: inputs.mode == 'scan'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Scan KernelSU repos for the SUSFS patch
-        shell: bash
-        run: |
-          set +e +o pipefail
-          git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/susfs4ksu
-          P=~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-          for repo in KernelSU-Next/KernelSU-Next tiann/KernelSU; do
-            rm -rf ~/ksu
-            git clone --quiet "https://github.com/$repo" ~/ksu || continue
-            cd ~/ksu
-            : > ~/res.txt
-            for ref in $(git tag) $(git branch -r | grep -v HEAD | sed 's|origin/||'); do
-              git checkout -q -f "$ref" 2>/dev/null || continue
-              out=$(git apply --check "$P" 2>&1)
-              fails=$(echo "$out" | grep -c "patch failed\|No such file")
-              core=no; [ -f kernel/core_hook.c ] && core=yes
-              echo "$fails  $ref  core_hook.c=$core" >> ~/res.txt
-            done
-            {
-              echo "## $repo (failed hunks, lower is better, 0 = patch applies)"
-              echo '```'
-              sort -n ~/res.txt | head -25
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            cd ~
-          done
-
   build:
-    if: inputs.mode == 'build'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -157,17 +55,40 @@ jobs:
           rm -rf KernelSU
           git clone --quiet "$IN_REPO" KernelSU
           (cd KernelSU && git checkout --quiet "$IN_BRANCH")
+
           if grep -q "SUSFS" KernelSU/kernel/Kconfig; then
             echo ">>> $IN_REPO $IN_BRANCH already has SUSFS"
           else
-            cp ~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-            if (cd KernelSU && git apply --check 10_enable_susfs_for_ksu.patch); then
-              (cd KernelSU && git apply --whitespace=fix 10_enable_susfs_for_ksu.patch)
-              echo ">>> $IN_REPO $IN_BRANCH accepted the SUSFS patch"
-            else
-              echo "FAILED: SUSFS patch does not apply to $IN_REPO $IN_BRANCH" | tee -a "$GITHUB_STEP_SUMMARY"
+            cd KernelSU
+            set +e
+            patch -p1 -F3 --no-backup-if-mismatch < ~/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch > ~/ksu_patch.log 2>&1
+            rc=$?
+            set -e
+            {
+              echo "## SUSFS patch on KernelSU (patch -F3)"
+              echo '```'
+              grep -E "^(patching file|Hunk|[0-9]+ out of)|FAILED|fuzz|offset" ~/ksu_patch.log | head -80
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ $rc -ne 0 ] || grep -q "FAILED" ~/ksu_patch.log || [ -n "$(find . -name '*.rej')" ]; then
+              echo "FAILED: SUSFS patch did not fully apply" | tee -a "$GITHUB_STEP_SUMMARY"
+              cat ~/ksu_patch.log
               exit 1
             fi
+            find . -name '*.orig' -delete
+            {
+              echo "## Check: renamed functions (definitions and callers must agree)"
+              echo '```'
+              grep -rn "escape_to_root\|setup_selinux(" kernel | head -30
+              echo '```'
+              echo "## Check: where the SUSFS helpers landed in selinux.c (must sit between functions)"
+              echo '```'
+              grep -n "ifdef CONFIG_KSU_SUSFS\|susfs_set_sid\|define DEVPTS_DOMAIN\|^bool is_zygote\|^u32 ksu_get_devpts_sid" kernel/selinux/selinux.c | head -30
+              n=$(grep -n "static inline void susfs_set_sid" kernel/selinux/selinux.c | head -1 | cut -d: -f1)
+              [ -n "$n" ] && sed -n "$((n-12)),$((n+3))p" kernel/selinux/selinux.c
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            cd ..
           fi
 
           (cd KernelSU && git rev-parse HEAD && git remote get-url origin && git describe --tags --always) | tee ~/gki/ksu_commit.txt
