@@ -4,7 +4,7 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Try the driver-side SUSFS patch against v3.4.0-legacy
+      - name: Check core_hook.c piece in isolation
         shell: bash
         run: |
           set +e +o pipefail
@@ -12,26 +12,17 @@ jobs:
           cd ~/k && git checkout -q v3.4.0-legacy
           git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/s
           P=~/s/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-
-          if grep -q "SUSFS" kernel/Kconfig; then
-            echo "v3.4.0-legacy ALREADY HAS SUSFS in Kconfig" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          patch -p1 -F3 --no-backup-if-mismatch < "$P" > ~/out.log 2>&1
+          # Extract just the core_hook.c hunk into its own patch file
+          awk '/^diff --git a\/kernel\/core_hook.c/{p=1} /^diff --git/ && !/core_hook.c/{p=0} p' "$P" > /tmp/core.patch
+          wc -l /tmp/core.patch
+          patch -p1 -F3 --no-backup-if-mismatch --dry-run < /tmp/core.patch > ~/out.log 2>&1
           {
-            echo "## patch -F3 result"
+            echo "## core_hook.c patch, dry run"
             echo '```'
-            grep -E "^(patching file|Hunk|[0-9]+ out of)|FAILED|fuzz|offset" ~/out.log | head -80
+            cat ~/out.log | head -60
             echo '```'
-            echo "## Rejected hunks, if any"
-            for f in $(find . -name '*.rej'); do
-              echo "### $f"
-              echo '```diff'
-              head -60 "$f"
-              echo '```'
-            done
-            echo "## Do the four functions exist now?"
+            echo "## Current ksu_try_umount / zygote / ksu_domain presence in core_hook.c"
             echo '```'
-            grep -rln "ksu_try_umount\|susfs_try_umount_all\|susfs_is_current_ksu_domain\|susfs_is_current_zygote_domain" kernel
+            grep -n "ksu_try_umount\|is_zygote\|is_ksu_domain\|_domain(" kernel/core_hook.c | head -30
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
