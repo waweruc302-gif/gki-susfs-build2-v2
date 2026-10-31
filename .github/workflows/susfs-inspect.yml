@@ -4,21 +4,34 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Find the four missing symbols
+      - name: Try the driver-side SUSFS patch against v3.4.0-legacy
         shell: bash
         run: |
           set +e +o pipefail
           git clone --quiet https://github.com/KernelSU-Next/KernelSU-Next ~/k
           cd ~/k && git checkout -q v3.4.0-legacy
           git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/s
+          P=~/s/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+
+          if grep -q "SUSFS" kernel/Kconfig; then
+            echo "v3.4.0-legacy ALREADY HAS SUSFS in Kconfig" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          patch -p1 -F3 --no-backup-if-mismatch < "$P" > ~/out.log 2>&1
           {
-            echo "## In KernelSU-Next v3.4.0-legacy driver source"
+            echo "## patch -F3 result"
             echo '```'
-            grep -rn "ksu_try_umount\|susfs_is_current_ksu_domain\|susfs_is_current_zygote_domain\|susfs_try_umount_all" ~/k/kernel | head -40
+            grep -E "^(patching file|Hunk|[0-9]+ out of)|FAILED|fuzz|offset" ~/out.log | head -80
             echo '```'
-            echo "## In the susfs4ksu patch set (any file)"
+            echo "## Rejected hunks, if any"
+            for f in $(find . -name '*.rej'); do
+              echo "### $f"
+              echo '```diff'
+              head -60 "$f"
+              echo '```'
+            done
+            echo "## Do the four functions exist now?"
             echo '```'
-            grep -rln "ksu_try_umount\b" ~/s/kernel_patches
-            grep -n "^+.*\(ksu_try_umount\|susfs_is_current_ksu_domain\|susfs_is_current_zygote_domain\|susfs_try_umount_all\)" ~/s/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch | head -40
+            grep -rln "ksu_try_umount\|susfs_try_umount_all\|susfs_is_current_ksu_domain\|susfs_is_current_zygote_domain" kernel
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
