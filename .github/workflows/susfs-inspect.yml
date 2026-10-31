@@ -4,38 +4,21 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Print the pieces the prctl and setuid fixes touch
+      - name: Find the four missing symbols
         shell: bash
         run: |
           set +e +o pipefail
-          git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/s
           git clone --quiet https://github.com/KernelSU-Next/KernelSU-Next ~/k
-          cd ~/k
-          git checkout -q v3.4.0-legacy || echo "TAG v3.4.0-legacy NOT FOUND"
+          cd ~/k && git checkout -q v3.4.0-legacy
+          git clone --quiet --depth=1 --branch kernel-5.4 https://gitlab.com/simonpunk/susfs4ksu.git ~/s
           {
-            echo "## Driver: $(git describe --tags --always) $(git rev-parse --short HEAD)"
-            echo "## How the tool calls the kernel"
+            echo "## In KernelSU-Next v3.4.0-legacy driver source"
             echo '```'
-            grep -n "prctl\|reboot\|syscall\|KERNEL_SU_OPTION\|0x555e" ~/s/ksu_susfs/jni/main.c | head -30
+            grep -rn "ksu_try_umount\|susfs_is_current_ksu_domain\|susfs_is_current_zygote_domain\|susfs_try_umount_all" ~/k/kernel | head -40
             echo '```'
-            echo "## Driver files with hooks"
+            echo "## In the susfs4ksu patch set (any file)"
             echo '```'
-            grep -rln "prctl\|sys_reboot\|ksu_handle_setresuid\|ksu_handle_setuid" kernel | head -30
-            echo '```'
-            echo "## prctl / reboot / setresuid lines"
-            echo '```'
-            grep -rn "prctl\|sys_reboot\|ksu_handle_setresuid\|ksu_handle_setuid\|CMD_SUSFS" kernel | head -50
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          F=$(find kernel -name setuid_hook.c | head -1)
-          {
-            echo "## $F (first 120 lines)"
-            echo '```c'
-            sed -n '1,120p' "$F"
-            echo '```'
-            echo "## task_struct field in the kernel patch"
-            echo '```'
-            grep -n "susfs_task_state\|TASK_STRUCT_NON_ROOT_USER_APP_PROC\|CMD_SUSFS" ~/s/kernel_patches/50_add_susfs_in_kernel-5.4.patch | head -20
-            grep -rn "CMD_SUSFS_ADD_SUS_PATH\b" ~/s/kernel_patches | head -5
+            grep -rln "ksu_try_umount\b" ~/s/kernel_patches
+            grep -n "^+.*\(ksu_try_umount\|susfs_is_current_ksu_domain\|susfs_is_current_zygote_domain\|susfs_try_umount_all\)" ~/s/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch | head -40
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
